@@ -23,6 +23,8 @@ import math
 from utils import *
 from modules import *
 
+m = 11 #節點數量
+seed = 45
 parser = argparse.ArgumentParser()
 
 # -----------data parameters ------
@@ -36,7 +38,7 @@ parser.add_argument('--data_dir', type=str, default= 'data/',
                     help='data file name containing the discrete files.')
 parser.add_argument('--data_sample_size', type=int, default=5000,
                     help='the number of samples of data')
-parser.add_argument('--data_variable_size', type=int, default=10,
+parser.add_argument('--data_variable_size', type=int, default=m,
                     help='the number of variables in synthetic generated data')
 parser.add_argument('--graph_type', type=str, default='erdos-renyi',
                     help='the type of DAG graph by generation method')
@@ -72,7 +74,7 @@ parser.add_argument('--use_A_positiver_loss', type = int, default = 0,
 
 parser.add_argument('--no-cuda', action='store_true', default=True,
                     help='Disables CUDA training.')
-parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--seed', type=int, default=seed, help='Random seed.')
 parser.add_argument('--epochs', type=int, default= 300,
                     help='Number of epochs to train.')
 parser.add_argument('--batch-size', type=int, default = 100, # note: should be divisible by sample size, otherwise throw an error
@@ -145,7 +147,7 @@ if args.save_folder:
     now = datetime.datetime.now()
     timestamp = now.isoformat()
     save_folder = '{}/exp{}/'.format(args.save_folder, timestamp)
-    # safe_name = save_folder.text.replace('/', '_')
+    save_folder = save_folder.replace(':', '_')
     os.makedirs(save_folder)
     meta_file = os.path.join(save_folder, 'metadata.pkl')
     encoder_file = os.path.join(save_folder, 'encoder.pt')
@@ -320,7 +322,7 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer):
         relations = relations.unsqueeze(2)
 
         optimizer.zero_grad()
-
+        # return x, logits, adj_A1, adj_A, self.z, self.z_positive, self.adj_A, self.Wa
         enc_x, logits, origin_A, adj_A_tilt_encoder, z_gap, z_positive, myA, Wa = encoder(data, rel_rec, rel_send)  # logits is of size: [num_sims, z_dims]
         edges = logits
 
@@ -331,6 +333,7 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer):
 
         target = data
         preds = output
+        # print(f"preds={preds.shape}") #100,100,1
         variance = 0.
 
         # reconstruction accuracy loss
@@ -361,6 +364,19 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer):
 
 
         loss.backward()
+        # 這裡會檢查所有參數的梯度
+        all_params = list(encoder.named_parameters()) + list(decoder.named_parameters())
+
+        # # 遍歷所有參數，檢查它們是否有梯度
+        # for name, param in all_params:
+        #     if param.grad is not None:
+        #         # 只印出有梯度的參數，如果梯度為零可以特別標記
+        #         grad_norm = param.grad.norm().item()
+        #         if grad_norm > 1e-8:  # 設定一個閾值來避免印出極小的數值
+        #             print(f"Epoch {epoch}, Parameter: {name}, Grad Norm: {grad_norm:.6f}")
+        #     else:
+        #         # 這是最關鍵的檢查：如果梯度為 None，代表計算圖斷了
+        #         print(f"Epoch {epoch}, Parameter: {name}, Grad is None!")
         loss = optimizer.step()
 
         myA.data = stau(myA.data, args.tau_A*lr)
