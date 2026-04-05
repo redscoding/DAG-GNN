@@ -7,13 +7,15 @@ Main function for traininng DAG-GNN
 
 from __future__ import division
 from __future__ import print_function
-
 import time
+run_start_time = time.time()
 import argparse
 import pickle
 import os
 import datetime
-
+import numpy as np
+import networkx as nx
+import csv
 # import torch
 import torch.optim as optim
 from torch.optim import lr_scheduler
@@ -24,29 +26,31 @@ from utils import *
 from modules import *
 
 m = 11 #節點數量
-seed = 45
+# m =80
+seed = 42
 parser = argparse.ArgumentParser()
 
+parser.add_argument('--run_id', type=int, default=0, help='用於標記這是第幾次獨立訓練 (Controller 專用)')
 # -----------data parameters ------
 # configurations
-parser.add_argument('--data_type', type=str, default= 'synthetic',
-                    choices=['synthetic', 'discrete', 'real'],
+parser.add_argument('--data_type', type=str, default='discrete',# 'synthetic',
+                    choices=['synthetic','real_DATA', 'discrete', 'real','coco','git_sachs_DATA'],
                     help='choosing which experiment to do.')
-parser.add_argument('--data_filename', type=str, default= 'alarm',
+parser.add_argument('--data_filename', type=str, default= 'sachs.pkl',
                     help='data file name containing the discrete files.')
 parser.add_argument('--data_dir', type=str, default= 'data/',
                     help='data file name containing the discrete files.')
-parser.add_argument('--data_sample_size', type=int, default=5000,
+parser.add_argument('--data_sample_size', type=int, default=7466,
                     help='the number of samples of data')
 parser.add_argument('--data_variable_size', type=int, default=m,
                     help='the number of variables in synthetic generated data')
-parser.add_argument('--graph_type', type=str, default='erdos-renyi',
+parser.add_argument('--graph_type', type=str, default='barabasi-albert',
                     help='the type of DAG graph by generation method')
 parser.add_argument('--graph_degree', type=int, default=2,
                     help='the number of degree in generated DAG graph')
-parser.add_argument('--graph_sem_type', type=str, default='linear-gauss',
+parser.add_argument('--graph_sem_type', type=str, default='linear-exp',
                     help='the structure equation model (SEM) parameter type')
-parser.add_argument('--graph_linear_type', type=str, default='nonlinear_2',
+parser.add_argument('--graph_linear_type', type=str, default='linear',
                     help='the synthetic data type: linear -> linear SEM, nonlinear_1 -> x=Acos(x+1)+z, nonlinear_2 -> x=2sin(A(x+0.5))+A(x+0.5)+z')
 parser.add_argument('--edge-types', type=int, default=2,
                     help='The number of edge types to infer.')
@@ -72,7 +76,7 @@ parser.add_argument('--use_A_positiver_loss', type = int, default = 0,
                     help = 'flag to enforce A must have positive values')
 
 
-parser.add_argument('--no-cuda', action='store_true', default=True,
+parser.add_argument('--no-cuda', action='store_true', default=False, #using cuda
                     help='Disables CUDA training.')
 parser.add_argument('--seed', type=int, default=seed, help='Random seed.')
 parser.add_argument('--epochs', type=int, default= 300,
@@ -130,6 +134,7 @@ parser.add_argument('--dynamic-graph', action='store_true', default=False,
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
+print(args.cuda)
 args.factor = not args.no_factor
 print(args)
 
@@ -165,7 +170,22 @@ else:
 # ================================================
 # get data: experiments = {synthetic SEM, ALARM}
 # ================================================
-train_loader, valid_loader, test_loader, ground_truth_G = load_data( args, args.batch_size, args.suffix)
+if args.data_type == 'discrete':
+    train_loader, valid_loader, test_loader= load_data(args, args.batch_size, args.suffix)
+    graph = {
+        7: [6],
+        8: [1, 2, 3, 4, 5, 11],
+        9: [3, 4, 5, 8, 11],
+        10: [6, 7],
+        11: [4],
+        4: [2],
+        3: [8],
+        2: [1],
+    }
+    ground_truth_G = nx.DiGraph(graph)
+else:
+    train_loader, valid_loader, test_loader, ground_truth_G = load_data( args, args.batch_size, args.suffix)
+
 
 #===================================
 # load modules
@@ -180,7 +200,12 @@ rel_send = torch.DoubleTensor(rel_send)
 
 # add adjacency matrix A
 num_nodes = args.data_variable_size
-adj_A = np.zeros((num_nodes, num_nodes))
+if args.cuda:
+    # device = torch.device("cuda")
+    adj_A_np = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+    adj_A = torch.from_numpy(adj_A_np).to('cuda')
+else:
+    adj_A = np.zeros((num_nodes, num_nodes))
 
 
 if args.encoder == 'mlp':
@@ -245,8 +270,8 @@ if args.prior:
     log_prior = torch.unsqueeze(log_prior, 0)
     log_prior = Variable(log_prior)
 
-    if args.cuda:
-        log_prior = log_prior.cuda()
+    # if args.cuda:
+    #     log_prior = log_prior.cuda()
 
 if args.cuda:
     encoder.cuda()
@@ -320,13 +345,14 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer):
 
         # reshape data
         relations = relations.unsqueeze(2)
+        data = data.unsqueeze(-1)
 
         optimizer.zero_grad()
         # return x, logits, adj_A1, adj_A, self.z, self.z_positive, self.adj_A, self.Wa
-        enc_x, logits, origin_A, adj_A_tilt_encoder, z_gap, z_positive, myA, Wa = encoder(data, rel_rec, rel_send)  # logits is of size: [num_sims, z_dims]
+        enc_x, logits, origin_A, adj_A_tilt_encoder, z_gap, z_positive, myA, Wa = encoder(data)  # logits is of size: [num_sims, z_dims]
         edges = logits
 
-        dec_x, output, adj_A_tilt_decoder = decoder(data, edges, args.data_variable_size * args.x_dims, rel_rec, rel_send, origin_A, adj_A_tilt_encoder, Wa)
+        dec_x, output, adj_A_tilt_decoder = decoder(data, edges, args.data_variable_size * args.x_dims, origin_A, adj_A_tilt_encoder, Wa)
 
         if torch.sum(output != output):
             print('nan error\n')
@@ -385,7 +411,7 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer):
             print('nan error\n')
 
         # compute metrics
-        graph = origin_A.data.clone().numpy()
+        graph = origin_A.data.clone().cpu().numpy()
         graph[np.abs(graph) < args.graph_threshold] = 0
 
         fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(graph))
@@ -511,7 +537,7 @@ try:
     fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(best_MSE_graph))
     print('Best MSE Graph Accuracy: fdr', fdr, ' tpr ', tpr, ' fpr ', fpr, 'shd', shd, 'nnz', nnz)
 
-    graph = origin_A.data.clone().numpy()
+    graph = origin_A.data.clone().cpu().numpy()
     graph[np.abs(graph) < 0.1] = 0
     # print(graph)
     fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(graph))
@@ -545,7 +571,7 @@ except KeyboardInterrupt:
     fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(best_MSE_graph))
     print('Best MSE Graph Accuracy: fdr', fdr, ' tpr ', tpr, ' fpr ', fpr, 'shd', shd, 'nnz', nnz)
 
-    graph = origin_A.data.clone().numpy()
+    graph = origin_A.data.clone().cpu().numpy()
     graph[np.abs(graph) < 0.1] = 0
     # print(graph)
     fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(graph))
@@ -561,6 +587,80 @@ except KeyboardInterrupt:
     fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(graph))
     print('threshold 0.3, Accuracy: fdr', fdr, ' tpr ', tpr, ' fpr ', fpr, 'shd', shd, 'nnz', nnz)
 
+    # ==========================================
+    # 異常中斷的存檔與報表區塊
+    # ==========================================
+
+    run_end_time = time.time()
+    elapsed_seconds = run_end_time - run_start_time
+    elapsed_formatted = f"{elapsed_seconds / 60:.2f} min"
+
+    pool_dir = os.path.join('src', 'results')
+    os.makedirs(pool_dir, exist_ok=True)
+    current_run = args.run_id
+
+    if current_run == 0:
+        np.savetxt(os.path.join(pool_dir, 'trueG.txt'), nx.to_numpy_array(ground_truth_G), fmt='%.5f')
+
+    final_continuous_A = origin_A.data.clone().cpu().numpy()
+
+    csv_path = os.path.join(pool_dir, 'summary_report.csv')
+    file_exists = os.path.isfile(csv_path)
+
+    candidates = {}
+
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(
+                ['Filename', 'Run_ID', 'Threshold', 'SHD', 'TPR', 'FDR', 'NNZ', 'Duration', 'Status', 'Timestamp'])
+
+        thresholds = [0.1, 0.2, 0.3, 0.4, 0.5]
+        for t in thresholds:
+            g_thresh = final_continuous_A.copy()
+            g_thresh[np.abs(g_thresh) < t] = 0
+            g_thresh[g_thresh != 0] = 1
+
+            fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(g_thresh))
+
+            # 💡 差異點 1：檔名加上 _interrupted 標記
+            name_with_shd = f'thresh_{t}_shd_{shd}_interrupted'
+            candidates[name_with_shd] = g_thresh
+
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            file_name = f'candidate_run{current_run}_{name_with_shd}.txt'
+
+            # 💡 差異點 2：狀態標記為 'Interrupted'
+            writer.writerow(
+                [file_name, current_run, t, shd, tpr, fdr, nnz, elapsed_formatted, 'Interrupted', current_time])
+
+    for name, graph_mat in candidates.items():
+        file_name = f'candidate_run{current_run}_{name}.txt'
+        file_path = os.path.join(pool_dir, file_name)
+        np.savetxt(file_path, graph_mat, fmt='%d')
+
+    print(f"\n[搶救成功] Run {current_run} 異常中斷 (耗時 {elapsed_formatted})！已存入 {len(candidates)} 張中斷候選圖。")
+
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5]
+    for t in thresholds:
+        g_thresh = final_continuous_A.copy()
+        g_thresh[np.abs(g_thresh) < t] = 0
+        g_thresh[g_thresh != 0] = 1
+        candidates[f'thresh_{t}'] = g_thresh
+
+    # ==========================================
+    # 將所有候選圖存成獨立的 txt 檔案 (防覆蓋機制)
+    # ==========================================
+    for name, graph_mat in candidates.items():
+        # 【關鍵防護】在檔名中間安插 run_{current_run}
+        file_name = f'candidate_run{current_run}_{name}.txt'
+        file_path = os.path.join(pool_dir, file_name)
+        np.savetxt(file_path, graph_mat, fmt='%d')  # 存成整數 0 和 1
+
+    print(f"\n[成功] Run {current_run}：已將 {len(candidates)} 張候選圖存入資料夾：{pool_dir}/")
+    import sys
+    sys.exit(0)
+
 
 f = open('trueG', 'w')
 matG = np.matrix(nx.to_numpy_array(ground_truth_G))
@@ -568,12 +668,75 @@ for line in matG:
     np.savetxt(f, line, fmt='%.5f')
 f.closed
 
-f1 = open('predG', 'w')
-matG1 = np.matrix(origin_A.data.clone().numpy())
+f1 = open('results/predG', 'w')
+matG1 = np.matrix(origin_A.data.clone().cpu().numpy())
 for line in matG1:
     np.savetxt(f1, line, fmt='%.5f')
 f1.closed
 
+
+
+# ==========================================
+# 停止碼錶，計算這一個 Run 總共花了多少時間
+# ==========================================
+run_end_time = time.time()
+elapsed_seconds = run_end_time - run_start_time
+elapsed_formatted = f"{elapsed_seconds / 60:.2f} min"  # 換算成分鐘，保留小數點後兩位
+
+# 固定存在 src/results
+pool_dir = os.path.join('src', 'results')
+os.makedirs(pool_dir, exist_ok=True)
+current_run = args.run_id
+
+# 1. 存下真實的 Ground Truth
+if current_run == 0:
+    np.savetxt(os.path.join(pool_dir, 'trueG.txt'), nx.to_numpy_array(ground_truth_G), fmt='%.5f')
+
+# 2. 獲取最後的連續權重矩陣
+final_continuous_A = origin_A.data.clone().cpu().numpy()
+
+# 準備 CSV 報表的標題
+csv_path = os.path.join(pool_dir, 'summary_report.csv')
+file_exists = os.path.isfile(csv_path)
+
+candidates = {}
+
+with open(csv_path, 'a', newline='') as f:
+    writer = csv.writer(f)
+    if not file_exists:
+        # 💡 表頭新增了 'Duration' 欄位！
+        writer.writerow(['Filename', 'Run_ID', 'Threshold', 'SHD', 'TPR', 'FDR', 'NNZ', 'Duration', 'Timestamp'])
+
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.5]
+    for t in thresholds:
+        g_thresh = final_continuous_A.copy()
+        g_thresh[np.abs(g_thresh) < t] = 0
+        g_thresh[g_thresh != 0] = 1
+
+        # 計算指標
+        fdr, tpr, fpr, shd, nnz = count_accuracy(ground_truth_G, nx.DiGraph(g_thresh))
+
+        name_with_shd = f'thresh_{t}_shd_{shd}'
+        candidates[name_with_shd] = g_thresh
+
+        # 記錄當下時間
+        current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        file_name = f'candidate_run{current_run}_{name_with_shd}.txt'
+
+        # 💡 把 elapsed_formatted (花費時間) 寫進去！
+        writer.writerow([file_name, current_run, t, shd, tpr, fdr, nnz, elapsed_formatted, current_time])
+
+# 將所有候選圖存成獨立的 txt 檔案
+for name, graph_mat in candidates.items():
+    file_name = f'candidate_run{current_run}_{name}.txt'
+    file_path = os.path.join(pool_dir, file_name)
+    np.savetxt(file_path, graph_mat, fmt='%d')
+
+print(f"\n[成功] Run {current_run} 結束 (耗時 {elapsed_formatted})！已將 {len(candidates)} 張圖與實驗數據存入 {pool_dir}/")
+
+if log is not None:
+    print(save_folder)
+    log.close()
 
 if log is not None:
     print(save_folder)
