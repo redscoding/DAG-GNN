@@ -71,11 +71,11 @@ parser.add_argument('--optimizer', type = str, default = 'Adam',
                     help = 'the choice of optimizer used')
 parser.add_argument('--graph_threshold', type=  float, default = 0.3,  # 0.3 is good, 0.2 is error prune
                     help = 'threshold for learned adjacency matrix binarization')
-parser.add_argument('--tau_A', type = float, default=0.01,
+parser.add_argument('--tau_A', type = float, default=0.001,
                     help='coefficient for L-1 norm of A.')
 parser.add_argument('--lambda_A',  type = float, default= 0.,
                     help='coefficient for DAG constraint h(A).')
-parser.add_argument('--c_A',  type = float, default= 1,#defult = 1
+parser.add_argument('--c_A',  type = float, default= 0.01,#defult = 1
                     help='coefficient for absolute value h(A).')
 parser.add_argument('--use_A_connect_loss',  type = int, default= 0,
                     help='flag to use A connect loss')
@@ -255,8 +255,28 @@ if args.load_folder:
 #===================================
 # set up training parameters
 #===================================
+
+# 1. 取得 adj_A 的 id 集合
+adj_a_params_ids = {id(p) for p in [encoder.adj_A]}
+
+# 2. 過濾 Encoder 參數：排除掉 adj_A
+encoder_params = [
+    p for p in encoder.parameters()
+    if id(p) not in adj_a_params_ids
+]
+
+# 3. 過濾 Decoder 參數：排除掉已經在 Encoder 或 adj_A 裡出現過的參數
+# (防止 encoder 和 decoder 共享了某些 Layer)
+seen_ids = adj_a_params_ids.union({id(p) for p in encoder_params})
+
+decoder_params = [
+    p for p in decoder.parameters()
+    if id(p) not in seen_ids
+]
+
 if args.optimizer == 'Adam':
-    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()),lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-3)# defult no betas
+    # A 矩陣需要更敏銳的探索，而神經網路需要穩定的收斂
+    optimizer = optim.Adam(list(encoder.parameters()) + list(decoder.parameters()),lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)# defult no betas
 elif args.optimizer == 'LBFGS':
     optimizer = optim.LBFGS(list(encoder.parameters()) + list(decoder.parameters()),
                            lr=args.lr)
@@ -406,40 +426,40 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer, step):
         # 必須退回使用連續高斯分佈的 KL 散度
         # ==========================================
         loss_kl = kl_gaussian_true_vae(edges,logvar)  # <-- 把它解除註解，用這個！
-        loss_kl = loss_kl/11.0
+        loss_kl = loss_kl/num_nodes
         # loss_kl = kl_categorical_uniform(logits,m ,3, add_const=True) # <-- 把它註解掉或刪除！
 
         # ==========================================
         # 3. ELBO loss
         # ==========================================
         # 隨時間增加 beta 的範例邏輯
-        current_beta = min(args.beta, epoch / 300 * args.beta)
 
+        warmup_epochs = 50  # 給模型 50 輪的自由生長時間
 
-
-        loss = (current_beta * loss_kl) + 50.0 * loss_nll
-
-        # 外層 Lagrangian_steps 推進時，內層的 epoch 會歸零
-        if step == 0:
-            # 只有在最一開始的世界誕生期，才給它保護斜坡
-            if epoch < 20:
-                ratio = 0.0
-            else:
-                # 確保 ratio 絕對不會小於 0
-                ratio = min(1.0, max(0.0, (epoch - 20) / 100.0))
+        if epoch < warmup_epochs:
+            # 關閉所有警察和修剪器，讓 NLL 單獨發育 (就像我們成功的純 NLL 測試)
+            current_beta = 0.0
+            current_tau = 0.0
+            current_cA = 0.0
+            current_lambda = 0.0
+            current_trace_weight = 0.0
         else:
-            # 已經是 step >= 1 了，警察全面接管，火力全開！
-            ratio = 1.0
+            # ---------------------------------------------------------
+            # 階段二：結構發現期 (Structure Discovery Phase) - 引入約束
+            # ---------------------------------------------------------
+            # Beta 慢慢爬升 (防止特徵崩塌)
+            current_beta = min(args.beta, ((epoch - warmup_epochs) / 300) * args.beta)
 
-        # 統一用算好的 ratio 去打折
-        penalty_weight = c_A * ratio
-        current_lambda_A = lambda_A * ratio
-        current_tau_A = args.tau_A * ratio * 0.01
+            # 稀疏性直接給一個微小的固定值 (例如 0.001 或 0.0005)
+            current_tau = args.tau_A
 
+            # 拉格朗日警察上線 (使用外迴圈更新的 c_A 和 lambda_A)
+            current_cA = c_A
+            current_lambda = lambda_A
+            current_trace_weight = 1.0
 
-        # add A loss
-        one_adj_A = origin_A # torch.mean(adj_A_tilt_decoder, dim =0)
-        sparse_loss = current_tau_A * torch.sum(torch.abs(one_adj_A))
+         # add A loss
+        one_adj_A = origin_A  # torch.mean(adj_A_tilt_decoder, dim =0)
 
         # other loss term
         if args.use_A_connect_loss:
@@ -452,8 +472,14 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer, step):
 
         # compute h(A)
         h_A = _h_A(origin_A, args.data_variable_size)
-        # loss += lambda_A * h_A + 0.5 * c_A * h_A * h_A + 100. * torch.trace(origin_A*origin_A) + sparse_loss #+  0.01 * torch.sum(variance * variance)
-        loss += current_lambda_A * h_A + 0.5 * penalty_weight * h_A * h_A + 1. * torch.trace(origin_A*origin_A) + sparse_loss #+  0.01 * torch.sum(variance * variance)
+
+        sparse_loss = current_tau * torch.sum(torch.abs(one_adj_A))
+        dag_penalty = current_lambda * h_A + 0.5 * current_cA * h_A * h_A
+        # 忠於文獻的 Trace 懲罰
+        trace_penalty = current_trace_weight * torch.trace(origin_A * origin_A)
+
+        # 組合最終 Loss
+        loss = loss_nll + (current_beta * loss_kl) + sparse_loss + dag_penalty + trace_penalty
 
         loss.backward()
         if encoder.adj_A.grad is not None:
@@ -466,16 +492,20 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer, step):
         # 設定一個微小的門檻，大於這個值我們才算它是一條真正的邊
         current_nnz = (one_adj_A.abs() > 0.05).sum().item()
 
+        # 看看有沒有邊快要突破 0.3 了
+        strong_edges = (one_adj_A.abs() > 0.3).sum().item()
+        print(f"DEBUG: 權重 > 0.3 的邊數 = {strong_edges}")
+
         # 然後把 current_nnz 加到你原本印出 epoch 資訊的那行 print 裡面
         # 加上這行，把所有的關鍵數據放在同一個儀表板上
-        print(f"Epoch: {epoch:04d} NLL: {loss_nll.item():.4f} h_A: {h_A.item():.4f} c_A: {penalty_weight:.4f} nnz: {current_nnz}")
-        # all_params = list(encoder.parameters()) + list(decoder.parameters())
-        #
-        # # 執行梯度裁剪
-        # nn.utils.clip_grad_norm_(all_params, max_norm=2.0)
+        print(f"Epoch: {epoch:04d} NLL: {loss_nll.item():.4f} h_A: {h_A.item():.4f} c_A: {c_A:.4f} nnz: {current_nnz}")
+        all_params = list(encoder.parameters()) + list(decoder.parameters())
+
+        # 執行梯度裁剪
+        nn.utils.clip_grad_norm_(all_params, max_norm=2.0)
         optimizer.step()
 
-        myA.data = stau(myA.data,penalty_weight * current_tau_A*lr)
+        myA.data = stau(myA.data,c_A * current_tau*lr)
 
         if torch.sum(origin_A != origin_A):
             print('nan error\n')
@@ -649,7 +679,7 @@ try:
             A_new = origin_A.data.clone()
             h_A_new = _h_A(A_new, args.data_variable_size)
             if h_A_new.item() > 0.25 * h_A_old:
-                c_A*=5 #10
+                c_A*=1.2 #10
             else:
                 break
                 # pass# 進步很快，所以不加重處罰
