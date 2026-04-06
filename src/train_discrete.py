@@ -69,7 +69,7 @@ parser.add_argument('--z_dims', type=int, default=3,
 # -----------training hyperparameters
 parser.add_argument('--optimizer', type = str, default = 'Adam',
                     help = 'the choice of optimizer used')
-parser.add_argument('--graph_threshold', type=  float, default = 0.3,  # 0.3 is good, 0.2 is error prune
+parser.add_argument('--graph_threshold', type=  float, default = 0.05,  # 0.3 is good, 0.2 is error prune
                     help = 'threshold for learned adjacency matrix binarization')
 parser.add_argument('--tau_A', type = float, default=0.001,
                     help='coefficient for L-1 norm of A.')
@@ -92,9 +92,9 @@ parser.add_argument('--batch-size', type=int, default = 100, # note: should be d
                     help='Number of samples per batch.')
 parser.add_argument('--lr', type=float, default=1e-3,  # basline rate = 1e-3
                     help='Initial learning rate.')
-parser.add_argument('--encoder-hidden', type=int, default=32,
+parser.add_argument('--encoder-hidden', type=int, default=16,
                     help='Number of hidden units.')
-parser.add_argument('--decoder-hidden', type=int, default=32,
+parser.add_argument('--decoder-hidden', type=int, default=16,
                     help='Number of hidden units.')
 parser.add_argument('--temp', type=float, default=0.5,
                     help='Temperature for Gumbel softmax.')
@@ -493,12 +493,12 @@ def train(epoch, best_val_loss, ground_truth_G, lambda_A, c_A, optimizer, step):
         current_nnz = (one_adj_A.abs() > 0.05).sum().item()
 
         # 看看有沒有邊快要突破 0.3 了
-        strong_edges = (one_adj_A.abs() > 0.3).sum().item()
-        print(f"DEBUG: 權重 > 0.3 的邊數 = {strong_edges}")
+        max_weight = origin_A.abs().max().item()
+        strong_edges = (origin_A.abs() > 0.3).sum().item()
 
-        # 然後把 current_nnz 加到你原本印出 epoch 資訊的那行 print 裡面
-        # 加上這行，把所有的關鍵數據放在同一個儀表板上
-        print(f"Epoch: {epoch:04d} NLL: {loss_nll.item():.4f} h_A: {h_A.item():.4f} c_A: {c_A:.4f} nnz: {current_nnz}")
+        print(f"Epoch: {epoch:04d} | NLL: {loss_nll:.4f} | h_A: {h_A.item():.4f} | c_A: {c_A:.4f} | nnz(>0.05): {current_nnz} | strong(>0.3): {strong_edges} | max_W: {max_weight:.4f}")
+
+
         all_params = list(encoder.parameters()) + list(decoder.parameters())
 
         # 執行梯度裁剪
@@ -608,6 +608,7 @@ try:
         while c_A < 1e+20:
             for epoch in range(args.epochs):
                 ELBO_loss, NLL_loss,KL_loss, MSE_loss, graph, origin_A, stop_early = train(epoch, best_ELBO_loss, ground_truth_G, lambda_A, c_A, optimizer, step_k)
+
                 if stop_early:
                     print("h_A=0, epoch>=50")
                     break
